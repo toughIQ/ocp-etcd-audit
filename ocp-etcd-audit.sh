@@ -3,8 +3,11 @@
 # ====================================================================================
 # Script Name: ocp-etcd-audit.sh
 # Target:      OpenShift 4.x (Universal)
-# Description: ETCD Audit Tool.
-#              Logic: Always sorts by object count. -s adds size column to the top N items.
+# Description: ETCD Audit Tool for Admins.
+#              Workflow:
+#              1. Standard: Overview + Top 15 Counts.
+#              2. Focus (-a, -s, -e): Hides overview, focuses on object analysis.
+#              3. Stats: Shows Total ETCD Keys vs. API Objects vs. Displayed.
 # Usage:       ./ocp-etcd-audit.sh [options]
 # ====================================================================================
 
@@ -30,8 +33,8 @@ usage() {
     echo -e "Usage: $0 [OPTIONS]"
     echo -e "\nOptions:"
     echo -e "  -n <number>        Show top <number> objects by COUNT (Default: 15)"
-    echo -e "  -a, --all          Show ALL objects (sorted by count)"
-    echo -e "  -s, --size         Add JSON size column to the output list"
+    echo -e "  -a, --all          Show ALL objects (Focus Mode: Hides Cluster Info)"
+    echo -e "  -s, --size         Add JSON size column (Focus Mode: Hides Cluster Info)"
     echo -e "                     ${YELLOW}Note: Calculates size only for the displayed items.${NC}"
     echo -e "  -e, --exact <res>  Calculate EXACT size via ETCD for ONE resource (Focus Mode)"
     echo -e "                     ${RED}WARNING: Creates high I/O load on ETCD directly!${NC}"
@@ -43,15 +46,18 @@ usage() {
 # Parse Arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        -a|--all) SHOW_ALL=true ;;
+        -a|--all) 
+            SHOW_ALL=true
+            FULL_REPORT=false # Focus Mode requested
+            ;;
         -n|--number) LIMIT="$2"; shift ;;
         -s|--size) 
             CALC_SIZE=true 
-            FULL_REPORT=false 
+            FULL_REPORT=false # Focus Mode requested
             ;;
         -e|--exact) 
             EXACT_RESOURCE="$2" 
-            FULL_REPORT=false 
+            FULL_REPORT=false # Focus Mode requested
             shift 
             ;;
         -y|--yes) CONFIRM_ALL=true ;;
@@ -69,7 +75,7 @@ if ! oc whoami &> /dev/null; then
     exit 1
 fi
 
-# 2. Pod Selection
+# 2. Pod Selection (Always needed for ETCD stats/size)
 ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
 
 if [ -z "$ETCD_POD" ]; then
@@ -132,7 +138,7 @@ fi
 
 
 # ------------------------------------------------------------------------------------
-# GENERAL CLUSTER HEALTH (Full Report Only)
+# GENERAL CLUSTER HEALTH (Only if FULL_REPORT is true)
 # ------------------------------------------------------------------------------------
 if [ "$FULL_REPORT" = true ]; then
     echo -e "\n${BOLD}1. Cluster Operator Health:${NC}"
@@ -150,13 +156,8 @@ if [ "$FULL_REPORT" = true ]; then
     echo "------------------------------------------------------------------------------------------------------------------------"
     oc get pods -n openshift-etcd -l app=etcd -o custom-columns="NAME:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase,IP:.status.podIP,RESTARTS:.status.containerStatuses[0].restartCount,START_TIME:.metadata.creationTimestamp"
     echo "------------------------------------------------------------------------------------------------------------------------"
-fi
-
-
-# ------------------------------------------------------------------------------------
-# SECTION 3: DATABASE SIZE & FRAGMENTATION
-# ------------------------------------------------------------------------------------
-if [ "$FULL_REPORT" = true ]; then
+    
+    # SECTION 3: DB SIZE
     echo -e "\n${BOLD}3. Database Size & Fragmentation (Endpoint Status):${NC}"
     printf "${BOLD}%-25s %-15s %-15s %-20b${NC}\n" "Node IP" "Phys. Size" "Used Data" "Fragmentation"
     echo "--------------------------------------------------------------------------------"
@@ -195,71 +196,95 @@ fi
 
 
 # ------------------------------------------------------------------------------------
-# OBJECT ANALYSIS (Classic Workflow: Sort by Count)
+# OBJECT ANALYSIS (Always Runs)
 # ------------------------------------------------------------------------------------
-if [ "$FULL_REPORT" = true ] || [ "$CALC_SIZE" = true ]; then
+# Header Logic based on mode
+if [ "$FULL_REPORT" = true ]; then
+    echo -e "\n${BOLD}4. Storage Consumers:${NC}"
+else
+    # In Focus mode (-a or -s), we skip the "4." numbering to make it cleaner
+    echo -e "\n${BOLD}Storage Consumers Analysis:${NC}"
+fi
 
-    # FILTER LOGIC: Always sort by count, filter early.
-    if [ "$SHOW_ALL" = true ]; then 
-        DISPLAY_TEXT="ALL objects"; 
-        FILTER_CMD="cat"
-    else 
-        DISPLAY_TEXT="Top $LIMIT objects by Count"; 
-        FILTER_CMD="head -n $LIMIT"
+# 1. GATHER TOTAL STATS
+# ---------------------
+# API Total (Logical)
+API_TOTAL=$(oc get --raw /metrics | grep 'apiserver_storage_objects' | grep -v '#' | awk '{s+=$2} END {print s}')
+
+# ETCD Raw Total (Physical)
+# FIX: Use sed to extract only digits, ignoring spaces or colons to prevent parsing errors
+ETCD_RAW=$(oc exec -n openshift-etcd "$ETCD_POD" -c etcd -- etcdctl get / --prefix --count-only --write-out=fields 2>/dev/null | grep "Count" | sed 's/[^0-9]*//g')
+
+
+# 2. PREPARE LIST BUFFER
+# ----------------------
+# We buffer the output first to calculate the "Displayed Sum" before printing the table.
+FILTER_CMD="head -n $LIMIT"
+[ "$SHOW_ALL" = true ] && FILTER_CMD="cat"
+
+LIST_BUFFER=$(mktemp)
+
+# Pipeline: Get Metrics -> Parse -> Sort by Count -> Filter Top N -> Save to Buffer
+oc get --raw /metrics | grep 'apiserver_storage_objects' | grep -v '#' | \
+awk '{ match($0, /resource="([^"]+)"/, m); print $2, m[1] }' | \
+awk '{a[$2]+=$1} END {for (i in a) print a[i], i}' | \
+sort -nr | $FILTER_CMD > "$LIST_BUFFER"
+
+# Calculate Sum of displayed items
+DISPLAYED_SUM=$(awk '{s+=$1} END {print s}' "$LIST_BUFFER")
+
+
+# 3. PRINT STATS HEADER
+# ---------------------
+echo "------------------------------------------------------------"
+printf "Total Keys (ETCD Raw):    ${BOLD}%-10s${NC} (Physical DB Entries)\n" "$ETCD_RAW"
+printf "Total Objects (API):      ${BOLD}%-10s${NC} (Logical K8s Resources)\n" "$API_TOTAL"
+printf "Displayed in list:        ${BOLD}%-10s${NC} (Sum of listed items)\n" "$DISPLAYED_SUM"
+echo "------------------------------------------------------------"
+
+if [ "$CALC_SIZE" = true ]; then
+    echo -e "${YELLOW}Ordered by: Count (Includes estimated JSON size)${NC}"
+    printf "%-10s %-45s %-25s\n" "Count" "Resource" "Est. JSON Size (API)"
+    echo "------------------------------------------------------------------------------------------"
+    
+    # Warn if huge
+    if [ "$SHOW_ALL" = true ] && [ "$CONFIRM_ALL" = false ]; then
+        echo -e "${RED}Warning: Calculating size for ALL $API_TOTAL items generates load.${NC}"
+        read -p "Proceed? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then rm "$LIST_BUFFER"; exit 0; fi
     fi
-
-    echo -e "\n${BOLD}4. Storage Consumers ($DISPLAY_TEXT):${NC}"
-
-    if [ "$CALC_SIZE" = true ]; then
-        # HEADER WITH SIZE
-        echo -e "${YELLOW}Source: API Server Metrics. Ordered by Count. Includes Size Calculation.${NC}"
-        echo "------------------------------------------------------------------------------------------"
-        printf "%-10s %-45s %-25s\n" "Count" "Resource" "Est. JSON Size (API)"
-        echo "------------------------------------------------------------------------------------------"
-        
-        # Only warn if we are calculating MANY items (Show All)
-        if [ "$SHOW_ALL" = true ] && [ "$CONFIRM_ALL" = false ]; then
-            echo -e "${RED}Calculating size for ALL items generates load.${NC}"
-            read -p "Proceed? (y/N): " confirm
-            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then exit 0; fi
-        fi
-
-    else
-        # HEADER STANDARD
-        echo -e "${YELLOW}Source: API Server Metrics. Ordered by Object Count.${NC}"
-        echo "------------------------------------------------------------"
-        printf "%-10s %-50s\n" "Count" "Resource"
-        echo "------------------------------------------------------------"
-    fi
-
-    # MAIN LOOP: Always Sort by Count -> Filter Top N -> Loop
-    oc get --raw /metrics | grep 'apiserver_storage_objects' | grep -v '#' | \
-    awk '{ match($0, /resource="([^"]+)"/, m); print $2, m[1] }' | \
-    awk '{a[$2]+=$1} END {for (i in a) print a[i], i}' | \
-    sort -nr | $FILTER_CMD | \
-    while read count resource; do
-        if [ "$count" -gt 20000 ]; then C_COLOR=$RED; elif [ "$count" -gt 10000 ]; then C_COLOR=$YELLOW; else C_COLOR=$NC; fi
-
-        if [ "$CALC_SIZE" = true ]; then
-            # Just calculate size for this specific item in the list
-            SIZE_BYTES=$(oc get "$resource" --all-namespaces -o json --ignore-not-found 2>/dev/null | wc -c)
-            
-            if [ "$SIZE_BYTES" -gt 1048576 ]; then SIZE_STR="$((SIZE_BYTES / 1024 / 1024)) MB"; else SIZE_STR="$((SIZE_BYTES / 1024)) KB"; fi
-            if [ "$SIZE_BYTES" -gt 104857600 ]; then S_COLOR=$RED; elif [ "$SIZE_BYTES" -gt 52428800 ]; then S_COLOR=$YELLOW; else S_COLOR=$NC; fi
-            
-            printf "${C_COLOR}%-10s${NC} %-45s ${S_COLOR}%-25s${NC}\n" "$count" "$resource" "$SIZE_STR"
-        else
-            # Standard output
-            printf "${C_COLOR}%-10s${NC} %-50s\n" "$count" "$resource"
-        fi
-    done
-
-    if [ "$CALC_SIZE" = true ]; then echo "------------------------------------------------------------------------------------------"; else echo "------------------------------------------------------------"; fi
+else
+    echo -e "${YELLOW}Ordered by: Count${NC}"
+    printf "%-10s %-50s\n" "Count" "Resource"
+    echo "------------------------------------------------------------"
 fi
 
 
+# 4. PRINT LIST FROM BUFFER
+# -------------------------
+while read count resource; do
+    if [ "$count" -gt 20000 ]; then C_COLOR=$RED; elif [ "$count" -gt 10000 ]; then C_COLOR=$YELLOW; else C_COLOR=$NC; fi
+
+    if [ "$CALC_SIZE" = true ]; then
+        SIZE_BYTES=$(oc get "$resource" --all-namespaces -o json --ignore-not-found 2>/dev/null | wc -c)
+        
+        if [ "$SIZE_BYTES" -gt 1048576 ]; then SIZE_STR="$((SIZE_BYTES / 1024 / 1024)) MB"; else SIZE_STR="$((SIZE_BYTES / 1024)) KB"; fi
+        if [ "$SIZE_BYTES" -gt 104857600 ]; then S_COLOR=$RED; elif [ "$SIZE_BYTES" -gt 52428800 ]; then S_COLOR=$YELLOW; else S_COLOR=$NC; fi
+        
+        printf "${C_COLOR}%-10s${NC} %-45s ${S_COLOR}%-25s${NC}\n" "$count" "$resource" "$SIZE_STR"
+    else
+        printf "${C_COLOR}%-10s${NC} %-50s\n" "$count" "$resource"
+    fi
+done < "$LIST_BUFFER"
+
+# Cleanup
+rm "$LIST_BUFFER"
+
+if [ "$CALC_SIZE" = true ]; then echo "------------------------------------------------------------------------------------------"; else echo "------------------------------------------------------------"; fi
+
+
 # ------------------------------------------------------------------------------------
-# PERFORMANCE LOGS (Full Report Only)
+# PERFORMANCE LOGS (Only if FULL_REPORT is true)
 # ------------------------------------------------------------------------------------
 if [ "$FULL_REPORT" = true ]; then
     echo -e "\n${BOLD}5. Disk Performance Check (WAL Fsync):${NC}"
