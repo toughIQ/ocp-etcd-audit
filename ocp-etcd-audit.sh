@@ -212,9 +212,9 @@ fi
 API_TOTAL=$(oc get --raw /metrics | grep 'apiserver_storage_objects' | grep -v '#' | awk '{s+=$2} END {print s}')
 
 # ETCD Raw Total (Physical)
-# FIX: Use sed to extract only digits, ignoring spaces or colons to prevent parsing errors
-ETCD_RAW=$(oc exec -n openshift-etcd "$ETCD_POD" -c etcd -- etcdctl get / --prefix --count-only --write-out=fields 2>/dev/null | grep "Count" | sed 's/[^0-9]*//g')
-
+# FIX: Use bash -c to ensure env var is set, and robust awk parsing for the JSON-like output.
+ETCD_RAW_CMD="export ETCDCTL_API=3; etcdctl get / --prefix --count-only --write-out=fields"
+ETCD_RAW=$(oc exec -n openshift-etcd "$ETCD_POD" -c etcd -- /bin/bash -c "$ETCD_RAW_CMD" 2>/dev/null | grep "Count" | awk '{print $NF}' | tr -d '"')
 
 # 2. PREPARE LIST BUFFER
 # ----------------------
