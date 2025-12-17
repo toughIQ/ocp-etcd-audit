@@ -6,7 +6,7 @@
 # Author:      Chris Tawfik (ctawfik@redhat.com) | toughIQ (toughiq@gmail.com)
 #              (with support from Gemini AI)
 # Description: ETCD Audit Tool for Admins.
-#              Includes 'Forensic Mode' with high-precision measurement & throttling.
+#              Includes 'Forensic Mode', Precision Math & Log Analysis.
 # Usage:       ./ocp-etcd-audit.sh [options]
 # ====================================================================================
 
@@ -27,6 +27,7 @@ EXACT_RESOURCE=""
 FULL_REPORT=true
 FORENSIC_MODE=false
 THROTTLE_SEC=1
+SHOW_LOGS=false
 
 # Function: Usage Help
 usage() {
@@ -37,6 +38,7 @@ usage() {
     echo -e "  -a, --all          Show ALL objects (Focus Mode)"
     echo -e "  -s, --size         Add JSON size column (Focus Mode)"
     echo -e "  -e, --exact <res>  Calculate EXACT size via ETCD for ONE resource (Focus Mode)"
+    echo -e "  -l, --logs         Show ALL slow request log entries (Default: Show last 5)"
     echo -e "  -y, --yes          Skip interactive confirmations (Disabled in Forensic Mode)"
     
     echo -e "\n${RED}Dangerous Options:${NC}"
@@ -65,6 +67,9 @@ while [[ "$#" -gt 0 ]]; do
             EXACT_RESOURCE="$2" 
             FULL_REPORT=false 
             shift 
+            ;;
+        -l|--logs)
+            SHOW_LOGS=true
             ;;
         --forensic)
             FORENSIC_MODE=true
@@ -143,7 +148,6 @@ if [ "$FORENSIC_MODE" = true ]; then
     while read api_count resource; do
         
         # OPTIMIZATION: If API says 0 objects, don't bother searching ETCD.
-        # This prevents "Path not found" errors for empty resources.
         if [ "$api_count" -eq 0 ]; then
              printf "%-50s %-15s %-15s %-15s\n" "$resource" "0" "0" "0 B"
              continue
@@ -170,28 +174,23 @@ if [ "$FORENSIC_MODE" = true ]; then
             
             # 6. Format with Precision (Using bc)
             if [ "$BYTES" -gt 1048576 ]; then 
-                # MB Calculation
                 VAL=$(echo "scale=2; $BYTES / 1048576" | bc 2>/dev/null)
-                if [ -z "$VAL" ]; then VAL="$((BYTES / 1048576))"; fi # Fallback
+                if [ -z "$VAL" ]; then VAL="$((BYTES / 1048576))"; fi 
                 SIZE_STR="${VAL} MB"
             elif [ "$BYTES" -gt 1024 ]; then 
-                # KB Calculation
                 VAL=$(echo "scale=2; $BYTES / 1024" | bc 2>/dev/null)
-                if [ -z "$VAL" ]; then VAL="$((BYTES / 1024))"; fi # Fallback
+                if [ -z "$VAL" ]; then VAL="$((BYTES / 1024))"; fi 
                 SIZE_STR="${VAL} KB"
             else 
                 SIZE_STR="$BYTES B"
             fi
             
-            # Color logic
             if [ "$BYTES" -gt 52428800 ]; then S_COLOR=$RED; elif [ "$BYTES" -gt 10485760 ]; then S_COLOR=$YELLOW; else S_COLOR=$NC; fi
 
             printf "%-50s %-15s %-15s ${S_COLOR}%-15s${NC}\n" "$resource" "$api_count" "$ETCD_COUNT" "$SIZE_STR"
-            
             sleep "$THROTTLE_SEC"
         fi
     done
-    
     rm "$KEY_MAP"
     echo "---------------------------------------------------------------------------------------------------"
     echo -e "${BLUE}Forensic Audit Complete.${NC}"
@@ -354,11 +353,44 @@ fi
 
 if [ "$FULL_REPORT" = true ]; then
     echo -e "\n${BOLD}5. Disk Performance Check (WAL Fsync):${NC}"
-    SLOW_LOGS=$(oc logs -n openshift-etcd "$ETCD_POD" -c etcd --since=1h | grep -c "apply request took too long")
-    if [ "$SLOW_LOGS" -gt 0 ]; then
-        echo -e "Result: ${RED}Found $SLOW_LOGS slow requests.${NC} (Check storage latency)" 
+    
+    # Capture relevant logs from the last 1 hour
+    LOG_BUFFER=$(mktemp)
+    oc logs -n openshift-etcd "$ETCD_POD" -c etcd --since=1h > "$LOG_BUFFER"
+    
+    # Filter for Slow Requests
+    SLOW_REQUESTS=$(grep "apply request took too long" "$LOG_BUFFER")
+    SLOW_COUNT=$(echo "$SLOW_REQUESTS" | grep -c "apply request took too long")
+    
+    if [ "$SLOW_COUNT" -gt 0 ]; then
+        echo -e "Result: ${RED}Found $SLOW_COUNT slow requests.${NC} (Check storage latency)" 
+        
+        if [ "$SHOW_LOGS" = true ]; then
+            echo -e "${YELLOW}All occurrences (Last 1h):${NC}"
+            echo "$SLOW_REQUESTS"
+        else
+            echo -e "${YELLOW}Latest 5 occurrences:${NC}"
+            echo "$SLOW_REQUESTS" | tail -n 5
+            if [ "$SLOW_COUNT" -gt 5 ]; then
+                echo -e "... (Use ${BOLD}-l${NC} to show all $SLOW_COUNT entries)"
+            fi
+        fi
+        
+        # Correlate with potential triggers in the FULL log
+        echo -e "\n${BOLD}Diagnosis:${NC}"
+        TRIGGERS=$(grep -E -i "defrag|snapshot|compact" "$LOG_BUFFER" | grep -v "apply request took too long" | tail -n 3)
+        if [ ! -z "$TRIGGERS" ]; then
+             echo -e "Found maintenance tasks in logs that might cause latency:"
+             echo -e "${YELLOW}$TRIGGERS${NC}"
+        else
+             echo -e "No obvious maintenance tasks (defrag/snapshot) found near the events."
+             echo -e "This suggests ${RED}underlying storage/disk latency${NC}."
+        fi
+        
     else
         echo -e "Result: ${GREEN}No performance warnings found in logs.${NC}"
     fi
+    rm "$LOG_BUFFER"
+
     echo -e "\n${BLUE}${BOLD}>>> Audit Complete.${NC}"
 fi
