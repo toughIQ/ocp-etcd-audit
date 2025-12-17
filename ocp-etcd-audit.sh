@@ -2,7 +2,7 @@
 
 # ====================================================================================
 # Script Name: ocp-etcd-audit.sh
-# Target:      OpenShift 4.x (Universal)
+# Target:      OpenShift 4.x (Universal - Linux & MacOS)
 # Author:      Chris Tawfik (ctawfik@redhat.com) | toughIQ (toughiq@gmail.com)
 #              (with support from Gemini AI)
 # Description: ETCD Audit Tool for Admins.
@@ -149,8 +149,9 @@ if [ "$FORENSIC_MODE" = true ]; then
     echo "---------------------------------------------------------------------------------------------------"
     
     # Iterate API Resources
+    # FIX: Replaced GNU awk 'match' array with portable 'sub' logic for MacOS compatibility
     oc get --raw /metrics | grep 'apiserver_storage_objects' | grep -v '#' | \
-    awk '{ match($0, /resource="([^"]+)"/, m); print $2, m[1] }' | \
+    awk '{ count=$2; sub(/.*resource="/, "", $0); sub(/".*/, "", $0); print count, $0 }' | \
     awk '{a[$2]+=$1} END {for (i in a) print a[i], i}' | \
     sort -nr | \
     while read api_count resource; do
@@ -303,8 +304,10 @@ if [ "$FULL_REPORT" = true ] || [ "$CALC_SIZE" = true ] || [ "$SHOW_ALL" = true 
     [ "$SHOW_ALL" = true ] && FILTER_CMD="cat"
 
     LIST_BUFFER=$(mktemp)
+    
+    # FIX: Replaced GNU awk 'match' array with portable 'sub' logic for MacOS compatibility
     oc get --raw /metrics | grep 'apiserver_storage_objects' | grep -v '#' | \
-    awk '{ match($0, /resource="([^"]+)"/, m); print $2, m[1] }' | \
+    awk '{ count=$2; sub(/.*resource="/, "", $0); sub(/".*/, "", $0); print count, $0 }' | \
     awk '{a[$2]+=$1} END {for (i in a) print a[i], i}' | \
     sort -nr | $FILTER_CMD > "$LIST_BUFFER"
 
