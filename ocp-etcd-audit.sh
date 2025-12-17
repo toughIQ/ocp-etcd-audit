@@ -28,6 +28,7 @@ FULL_REPORT=true
 FORENSIC_MODE=false
 THROTTLE_SEC=1
 SHOW_LOGS=false
+SINCE="1h"
 
 # Function: Usage Help
 usage() {
@@ -38,13 +39,13 @@ usage() {
     echo -e "  -a, --all          Show ALL objects (Focus Mode)"
     echo -e "  -s, --size         Add JSON size column (Focus Mode)"
     echo -e "  -e, --exact <res>  Calculate EXACT size via ETCD for ONE resource (Focus Mode)"
-    echo -e "  -l, --logs         Show ALL slow request log entries (Default: Show last 5)"
+    echo -e "  -l, --logs         Show ALL slow request log entries (Focus Mode)"
+    echo -e "  -t, --since <time> Set log lookback duration (e.g., 30m, 48h). Use 'h' (no 'd'). Default: 1h"
     echo -e "  -y, --yes          Skip interactive confirmations (Disabled in Forensic Mode)"
     
     echo -e "\n${RED}Dangerous Options:${NC}"
     echo -e "  --forensic         ${RED}DEEP SCAN ALL RESOURCES.${NC} Measures exact Protobuf size in ETCD."
     echo -e "                     Requires manual input 'confirm'. Ignores -y."
-    echo -e "                     Uses Key-Discovery to find storage paths."
     echo -e "  --throttle <sec>   Wait time between checks in forensic mode (Default: 1s)"
     
     echo -e "\n  -h, --help         Show this help message"
@@ -70,6 +71,11 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         -l|--logs)
             SHOW_LOGS=true
+            FULL_REPORT=false
+            ;;
+        -t|--time|--since)
+            SINCE="$2"
+            shift
             ;;
         --forensic)
             FORENSIC_MODE=true
@@ -101,7 +107,9 @@ if [ -z "$ETCD_POD" ]; then
     echo -e "${RED}Error: No running ETCD pods found! Cannot proceed.${NC}"
     exit 1
 fi
-if [ "$FULL_REPORT" = true ] || [ "$FORENSIC_MODE" = true ]; then
+
+# Show chosen pod if we are in any report mode
+if [ "$FULL_REPORT" = true ] || [ "$FORENSIC_MODE" = true ] || [ "$SHOW_LOGS" = true ]; then
     echo -e "Using pod for diagnostics: ${YELLOW}$ETCD_POD${NC}"
 fi
 
@@ -146,33 +154,21 @@ if [ "$FORENSIC_MODE" = true ]; then
     awk '{a[$2]+=$1} END {for (i in a) print a[i], i}' | \
     sort -nr | \
     while read api_count resource; do
-        
-        # OPTIMIZATION: If API says 0 objects, don't bother searching ETCD.
         if [ "$api_count" -eq 0 ]; then
              printf "%-50s %-15s %-15s %-15s\n" "$resource" "0" "0" "0 B"
              continue
         fi
-        
-        # 1. Simplify Resource Name
         SEARCH_NAME="${resource%%.*}"
-        
-        # 2. DISCOVERY LOGIC
         SAMPLE_KEY=$(grep -m 1 "/${SEARCH_NAME}/" "$KEY_MAP")
         
         if [ -z "$SAMPLE_KEY" ]; then
             printf "%-50s %-15s %-15s %-15s\n" "$resource" "$api_count" "?" "Path not found"
         else
-            # 3. EXTRACT PREFIX
             PREFIX="${SAMPLE_KEY%/${SEARCH_NAME}/*}/${SEARCH_NAME}"
-            
-            # 4. Count Keys (Fast local grep)
             ETCD_COUNT=$(grep -c "^$PREFIX/" "$KEY_MAP")
-            
-            # 5. Measure Size (Heavy ETCD op)
             SIZE_CMD="export ETCDCTL_API=3; etcdctl get \"$PREFIX\" --prefix | wc -c"
             BYTES=$(oc exec -n openshift-etcd "$ETCD_POD" -c etcd -- /bin/bash -c "$SIZE_CMD" 2>/dev/null)
             
-            # 6. Format with Precision (Using bc)
             if [ "$BYTES" -gt 1048576 ]; then 
                 VAL=$(echo "scale=2; $BYTES / 1048576" | bc 2>/dev/null)
                 if [ -z "$VAL" ]; then VAL="$((BYTES / 1048576))"; fi 
@@ -351,44 +347,59 @@ if [ "$FULL_REPORT" = true ] || [ "$CALC_SIZE" = true ] || [ "$SHOW_ALL" = true 
     if [ "$CALC_SIZE" = true ]; then echo "------------------------------------------------------------------------------------------"; else echo "------------------------------------------------------------"; fi
 fi
 
-if [ "$FULL_REPORT" = true ]; then
-    echo -e "\n${BOLD}5. Disk Performance Check (WAL Fsync):${NC}"
+
+# ------------------------------------------------------------------------------------
+# DISK PERFORMANCE CHECK (Logs)
+# ------------------------------------------------------------------------------------
+if [ "$FULL_REPORT" = true ] || [ "$SHOW_LOGS" = true ]; then
     
-    # Capture relevant logs from the last 1 hour
+    if [ "$FULL_REPORT" = true ]; then
+        echo -e "\n${BOLD}5. Disk Performance Check (WAL Fsync - Last $SINCE):${NC}"
+    else
+        echo -e "\n${BOLD}Disk Performance Analysis (Last $SINCE Logs):${NC}"
+    fi
+    
+    # Capture relevant logs based on SINCE parameter
     LOG_BUFFER=$(mktemp)
-    oc logs -n openshift-etcd "$ETCD_POD" -c etcd --since=1h > "$LOG_BUFFER"
+    oc logs -n openshift-etcd "$ETCD_POD" -c etcd --since="$SINCE" > "$LOG_BUFFER"
     
     # Filter for Slow Requests
-    SLOW_REQUESTS=$(grep "apply request took too long" "$LOG_BUFFER")
-    SLOW_COUNT=$(echo "$SLOW_REQUESTS" | grep -c "apply request took too long")
+    RAW_SLOW=$(grep "apply request took too long" "$LOG_BUFFER")
+    SLOW_COUNT=$(echo "$RAW_SLOW" | grep -c "apply request took too long")
     
+    # Helper to Prettify JSON logs
+    prettify_log() {
+        sed -E 's/.*"ts":"([^"]+)".*"msg":"([^"]+)","took":"([^"]+)".*/[\1] \2 (\3)/'
+    }
+
     if [ "$SLOW_COUNT" -gt 0 ]; then
         echo -e "Result: ${RED}Found $SLOW_COUNT slow requests.${NC} (Check storage latency)" 
         
         if [ "$SHOW_LOGS" = true ]; then
-            echo -e "${YELLOW}All occurrences (Last 1h):${NC}"
-            echo "$SLOW_REQUESTS"
+            echo -e "${YELLOW}All occurrences (Last $SINCE):${NC}"
+            echo "$RAW_SLOW" | prettify_log
         else
-            echo -e "${YELLOW}Latest 5 occurrences:${NC}"
-            echo "$SLOW_REQUESTS" | tail -n 5
+            echo -e "${YELLOW}Latest 5 occurrences (Last $SINCE):${NC}"
+            echo "$RAW_SLOW" | tail -n 5 | prettify_log
             if [ "$SLOW_COUNT" -gt 5 ]; then
-                echo -e "... (Use ${BOLD}-l${NC} to show all $SLOW_COUNT entries)"
+                echo -e "... (Use ${BOLD}-l or --logs${NC} to view all $SLOW_COUNT entries)"
             fi
         fi
         
-        # Correlate with potential triggers in the FULL log
+        # Correlate with potential triggers
         echo -e "\n${BOLD}Diagnosis:${NC}"
         TRIGGERS=$(grep -E -i "defrag|snapshot|compact" "$LOG_BUFFER" | grep -v "apply request took too long" | tail -n 3)
         if [ ! -z "$TRIGGERS" ]; then
              echo -e "Found maintenance tasks in logs that might cause latency:"
-             echo -e "${YELLOW}$TRIGGERS${NC}"
+             # Prettify generic triggers
+             echo "$TRIGGERS" | sed -E 's/.*"ts":"([^"]+)".*"msg":"([^"]+)".*/[\1] \2/' | sed 's/}/ /g' 
         else
              echo -e "No obvious maintenance tasks (defrag/snapshot) found near the events."
              echo -e "This suggests ${RED}underlying storage/disk latency${NC}."
         fi
         
     else
-        echo -e "Result: ${GREEN}No performance warnings found in logs.${NC}"
+        echo -e "Result: ${GREEN}No performance warnings found in logs (Last $SINCE).${NC}"
     fi
     rm "$LOG_BUFFER"
 
