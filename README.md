@@ -124,5 +124,6 @@ This project is licensed under the MIT License.
 **Authors:**
 * **Chris Tawfik** (ctawfik@redhat.com)
 * **toughIQ** (toughiq@gmail.com)
+* **Molty** 🦊 (OpenClaw Agent)
 
 *Developed with support from Gemini AI.*
